@@ -15,6 +15,66 @@ def _clone_process_template(process):
     return cloned
 
 
+def classify_activity_name(name):
+    """
+    Classify an ecoinvent activity by its name.
+
+    ecoinvent uses three naming patterns around markets:
+      - "market for X" / "market group for X": genuine market activities (mix of suppliers)
+      - "Y to generic market for X" and "Y to market for X": transfer activities feeding a
+        market. These are the ONLY supply-side activities ecoinvent offers for generic-market
+        products such as "concrete, normal strength", "cement, unspecified", "bleach",
+        "supplementary cementitious materials" or "ethanol, ..., vehicle grade". They contain
+        the substring "market for" but are producers, not markets.
+      - "X, import from Z": import activities, treated as neither producer nor market.
+
+    :param name: [str] activity name
+    :return: dict of booleans: is_market, is_transfer, is_import, is_producer
+    """
+    is_transfer = ("generic market" in name) or (" to market for " in name)
+    is_market = (("market for" in name) or ("market group for" in name)) and not is_transfer
+    is_import = "import from" in name
+    is_producer = (not is_market) and (not is_import)
+    return {
+        "is_market": is_market,
+        "is_transfer": is_transfer,
+        "is_import": is_import,
+        "is_producer": is_producer,
+    }
+
+
+def build_ecoinvent_indices(ei_wurst):
+    """
+    Build the lookup indices used by first_order_regionalization from an ecoinvent wurst list.
+    Extracted so the classification can be unit-tested without an ecoinvent licence.
+
+    :param ei_wurst: list of ecoinvent datasets in wurst format
+    :return: (non_market_by_product, market_by_product, exact_process_lookup, market_candidates_lookup)
+    """
+    non_market_by_product = defaultdict(list)
+    market_by_product = defaultdict(list)
+    exact_process_lookup = {}
+    market_candidates_lookup = defaultdict(list)
+    for ds in ei_wurst:
+        product = ds.get("reference product")
+        if not product:
+            continue
+        name = ds.get("name", "")
+        location = ds.get("location")
+        database = ds.get("database")
+        activity_type = classify_activity_name(name)
+
+        if activity_type["is_producer"]:
+            non_market_by_product[product].append(ds)
+            exact_process_lookup[(product, name, location, database)] = ds
+
+        if activity_type["is_market"]:
+            market_by_product[product].append(ds)
+            market_candidates_lookup[(product, location, database)].append(ds)
+
+    return non_market_by_product, market_by_product, exact_process_lookup, market_candidates_lookup
+
+
 def first_order_regionalization(regio):
     """
     Function to regionalized the key inputs of each process: electricity, municipal solid waste and heat.
@@ -26,31 +86,24 @@ def first_order_regionalization(regio):
     )
 
     # Build in-memory indices once to avoid repeated full scans over regio.ei_wurst.
-    non_market_by_product = defaultdict(list)
-    market_by_product = defaultdict(list)
-    exact_process_lookup = {}
-    market_candidates_lookup = defaultdict(list)
-    for ds in regio.ei_wurst:
-        product = ds.get("reference product")
-        if not product:
-            continue
-        name = ds.get("name", "")
-        location = ds.get("location")
-        database = ds.get("database")
-        is_market = ("market for" in name) or ("market group for" in name)
-        is_generic = "generic market" in name
-        is_import = "import from" in name
-        is_to_market = "to market" in name
+    (
+        non_market_by_product,
+        market_by_product,
+        exact_process_lookup,
+        market_candidates_lookup,
+    ) = build_ecoinvent_indices(regio.ei_wurst)
 
-        if not is_market and not is_generic and not is_import:
-            non_market_by_product[product].append(ds)
-            exact_process_lookup[(product, name, location, database)] = ds
-
-        if is_market:
-            market_by_product[product].append(ds)
-
-        if is_market and not is_generic and not is_to_market:
-            market_candidates_lookup[(product, location, database)].append(ds)
+    # Fail early, with the full list, if any internationally-traded product has no producing
+    # activity in ecoinvent. Without producers the consumption markets created later would have
+    # no inputs and a total impact of zero.
+    missing_producers = [
+        product for product in regio.eco_to_hs_class if not non_market_by_product.get(product)
+    ]
+    if missing_producers:
+        raise ValueError(
+            "No producing activity found in ecoinvent for the following internationally-traded "
+            f"products (check ecoinvent_to_HS.json): {missing_producers}"
+        )
 
     # Cache repeated transport code -> reference product lookups.
     transport_ref_product_cache = {}
@@ -126,6 +179,21 @@ def first_order_regionalization(regio):
             regio.distribution_technologies[product] = {
                 k: v / sum_ for k, v in regio.distribution_technologies[product].items()
             }
+            # drop technologies that no ecoinvent market actually sources from (share == 0),
+            # so that no regionalized copies with a zero share are created for them. This
+            # matters for products that have both production activities and transfer
+            # activities (e.g. diesel, coke, bronze), where the transfer carries no share.
+            zero_share = {
+                k for k, v in regio.distribution_technologies[product].items() if v == 0
+            }
+            if zero_share:
+                regio.distribution_technologies[product] = {
+                    k: v
+                    for k, v in regio.distribution_technologies[product].items()
+                    if k not in zero_share
+                }
+                possibilities = {k: v for k, v in possibilities.items() if k not in zero_share}
+                possibilities_set = {k: v for k, v in possibilities_set.items() if k not in zero_share}
         else:
             regio.distribution_technologies[product] = {
                 k: 1 / len(regio.distribution_technologies[product])
@@ -137,8 +205,14 @@ def first_order_regionalization(regio):
                 k: v / number_of_markets for k, v in regio.transportation_modes[product].items()
             }
 
-        # create the global production market process within regioinvent
-        global_market_activity = copy.deepcopy(dataset)
+        # create the global production market process within regioinvent.
+        # Use an explicit template: the first producing activity of THIS product. (Previously the
+        # loop variable `dataset` was reused, which is stale from the previous product whenever
+        # filter_processes is empty, yielding production markets with the wrong reference
+        # product and unit.)
+        template_activity = filter_processes[0]
+        global_market_activity = copy.deepcopy(template_activity)
+        global_market_activity["reference product"] = product
 
         # rename activity
         global_market_activity["name"] = f"""production market for {product}"""

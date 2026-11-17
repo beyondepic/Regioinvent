@@ -58,6 +58,7 @@ def create_consumption_markets(regio):
         for code, source in source_by_cmd.items()
     }
 
+    dead_markets = []
     for product in tqdm(regio.eco_to_hs_class, leave=True):
         cmd_code = regio.eco_to_hs_class[product]
         # filter the product in regio.consumption_data
@@ -198,5 +199,15 @@ def create_consumption_markets(regio):
                 exc = dict(exchange_templates[inp])
                 exc["amount"] = amount
                 new_import_data["exchanges"].append(exc)
+            # a consumption market with only its production exchange has a total impact of
+            # zero and silently corrupts every process that consumes the product
+            if len(new_import_data["exchanges"]) == 1:
+                dead_markets.append((product, consumer))
             # add to database in wurst
             regio.regioinvent_in_wurst.append(new_import_data)
+
+    if dead_markets:
+        raise ValueError(
+            f"{len(dead_markets)} consumption market(s) were created without any technosphere "
+            f"input. First occurrences: {dead_markets[:10]}"
+        )
