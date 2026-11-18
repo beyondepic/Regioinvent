@@ -1,5 +1,7 @@
 import sqlite3
 
+from regioinvent.workflows.regionalization.validate import validate_regioinvent_processes
+
 
 def regionalize_ecoinvent_with_trade(regio, trade_database_path, target_database_name, cutoff):
     """
@@ -39,6 +41,7 @@ def regionalize_ecoinvent_with_trade(regio, trade_database_path, target_database
         regio.second_order_regionalization,
         regio.spatialize_elem_flows,
         regio.connect_ecoinvent_to_regioinvent,
+        lambda: validate_regioinvent_processes(regio),
         regio.write_database,
     ]
     for stage_fn in stages:

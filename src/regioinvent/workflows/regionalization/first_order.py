@@ -487,9 +487,23 @@ def first_order_regionalization(regio):
             )
             if not market_candidates:
                 raise ws.NoResults
+            # prefer a plain "market for" over a "market group for" when both exist at this
+            # location: a market group is a market of markets and carries no technologies
+            market_candidates = sorted(
+                market_candidates, key=lambda ds: ds["name"].startswith("market group for")
+            )
             market_process = market_candidates[0]
 
             regio_process = _clone_process_template(market_process)
+            # a market whose inputs are other markets of the same product (always the case for a
+            # market group) is resolved down to producing activities, otherwise the second-order
+            # rewiring turns those inputs into a self-loop of gain 1 (singular matrix)
+            regio_process["exchanges"] = expand_market_of_markets(
+                regio_process,
+                product,
+                market_candidates_lookup,
+                regio.regionalized_ecoinvent_db_name,
+            )
             # change location
             regio_process["location"] = prod_country
             # change code
@@ -668,3 +682,80 @@ def first_order_regionalization(regio):
                 # register the regionalized technology mix within the wurst database
                 if regio_market:
                     regio.regioinvent_in_wurst.append(regio_market)
+
+
+def _is_market_name(name):
+    """
+    True for genuine market activities ("market for X", "market group for X"), False for the
+    transfer activities "Y to generic market for X" / "Y to market for X", which contain the
+    substring "market for" but are supply-side activities, not markets.
+    """
+    if ("generic market" in name) or (" to market for " in name):
+        return False
+    return ("market for" in name) or ("market group for" in name)
+
+
+def expand_market_of_markets(market_process, product, market_candidates_lookup, db_name, _depth=0):
+    """
+    Return the exchanges of an ecoinvent market with every technosphere input that is itself a
+    market of the same product AT ANOTHER LOCATION replaced by that market's own inputs, scaled by
+    the share. Applied recursively (a market group of market groups resolves fully).
+
+    Why: a "market group for X | BR" is a market of markets whose inputs are the state-level
+    "market for X | BR-XX". When such a group is cloned as a technology mix, the second-order
+    rewiring points every one of those same-product market inputs at the technology mix of the
+    process location, i.e. at the clone itself. The shares sum to 1, so the clone consumes one
+    unit of itself per unit produced: a zero diagonal and a singular technosphere matrix
+    (ecoinvent 3.12: land use change in BR, 3 products).
+
+    A self-loss input (same name AND same location as the market itself, e.g. the tap-water
+    market consuming a little tap water) is kept as is; the second-order "losses" rule handles it
+    and its share is well below 1.
+
+    :param market_process: [dict] the ecoinvent market dataset (wurst format)
+    :param product: [str] its reference product
+    :param market_candidates_lookup: dict (product, location, database) -> list of market datasets
+    :param db_name: [str] the regionalized ecoinvent database name
+    :return: list of exchanges (production exchange first, then aggregated technosphere inputs)
+    """
+    if _depth > 8:
+        raise RecursionError(
+            f"Market of markets for '{product}' at {market_process['location']} does not resolve "
+            f"to producing activities within 8 levels."
+        )
+    own_key = (market_process["name"], market_process["location"])
+    production = [e for e in market_process["exchanges"] if e["type"] == "production"]
+    aggregated = {}
+    order = []
+
+    def _add(exc, scale):
+        key = exc.get("input") or (exc.get("name"), exc.get("product"), exc.get("location"))
+        if key not in aggregated:
+            e = copy.copy(exc)
+            e["amount"] = 0.0
+            aggregated[key] = e
+            order.append(key)
+        aggregated[key]["amount"] += exc["amount"] * scale
+
+    for exc in market_process["exchanges"]:
+        if exc["type"] != "technosphere":
+            continue
+        same_product_market = (
+            exc.get("product") == product
+            and _is_market_name(exc.get("name", ""))
+            and (exc.get("name"), exc.get("location")) != own_key
+        )
+        if not same_product_market:
+            _add(exc, 1.0)
+            continue
+        candidates = market_candidates_lookup.get((product, exc.get("location"), db_name), [])
+        sub = next((c for c in candidates if c["name"] == exc["name"]), None)
+        if sub is None:
+            # cannot resolve: keep the input as it is rather than silently dropping supply
+            _add(exc, 1.0)
+            continue
+        for sub_exc in expand_market_of_markets(sub, product, market_candidates_lookup, db_name, _depth + 1):
+            if sub_exc["type"] == "technosphere":
+                _add(sub_exc, exc["amount"])
+
+    return production + [aggregated[k] for k in order]
